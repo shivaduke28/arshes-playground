@@ -37,6 +37,15 @@ uniform float borderWidth;
 [range(0.0, 0.3, 0.05)]
 uniform float grain;
 
+[rgb(0.0, 0.0, 0.05)]
+uniform float3 lift;
+
+[rgb(0.0, 0.0, 0.0)]
+uniform float3 gamma;
+
+[rgb(1.0, 0.95, 0.9)]
+uniform float3 gain;
+
 enum Status {
     Idle = 0,
     Shooting = 1,
@@ -103,6 +112,9 @@ void updateState(uint3 id : SV_DispatchThreadID) {
     state[0] = s;
 }
 
+float3 toLinear(float3 c) { return pow(c, 2.2); }
+float3 toGamma(float3 c) { return pow(max(float3(0.0), c), 1.0 / 2.2); }
+
 float hash(float2 p) {
     float3 p3 = fract(float3(p.xyx) * 0.1031);
     p3 += dot(p3, p3.yzx + 33.33);
@@ -111,42 +123,46 @@ float hash(float2 p) {
 
 [shader("fragment")]
 float4 fragmentMain(float2 uv : TEXCOORD) : SV_Target {
-    float3 cam = cameraTex.Sample(samp, uv);
+    float3 cam = toLinear(cameraTex.Sample(samp, uv));
     float4 prev = backbuffer.Sample(samp, uv);
 
     float noise = hash(uv * resolution + float2(time * 1000.0, 0.0)) * 2.0 - 1.0;
 
-    // grading: contrast then saturation
+    // grading
     float3 graded = (cam - 0.5) * contrast + 0.5;
     float lum = dot(graded, float3(0.2126, 0.7152, 0.0722));
     graded = lerp(float3(lum), graded, saturation);
+    graded = pow(max(float3(0.0), graded * (1.0 + gain - lift) + lift), max(float3(0.0001), 1.0 - gamma));
     graded += noise * grain;
 
     let s = state[0];
 
     switch (s.status) {
     case Status.Idle:
-        return float4(graded * (exposure * shutterSpeed + (exposure + flashIntensity) * s.avgDeltaTime), 1.0);
+        float3 idle = graded * (exposure * shutterSpeed + (exposure + flashIntensity) * s.avgDeltaTime);
+        return float4(toGamma(idle), 1.0);
 
     case Status.Flashing: {
-        float3 base = rearFlash ? prev.rgb : float3(0.0);
+        float3 base = rearFlash ? toLinear(prev.rgb) : float3(0.0);
         float3 acc = base + graded * (exposure + flashIntensity) * deltaTime;
-        return float4(acc, 1.0);
+        return float4(toGamma(acc), 1.0);
     }
 
     case Status.Shooting: {
         float elapsed = time - s.startTime;
 
-        float3 base = (s.frameCount == 0 && rearFlash) ? float3(0.0) : prev.rgb;
+        float3 base = (s.frameCount == 0 && rearFlash) ? float3(0.0) : toLinear(prev.rgb);
         float3 acc = base + graded * exposure * deltaTime;
+
+        float3 result = toGamma(acc);
 
         float progress = saturate(elapsed / shutterSpeed);
         float barH = 0.006;
         if (uv.y > 1.0 - barH && uv.x < progress) {
-            acc = float3(1.0, 0.4, 0.2);
+            result = float3(1.0, 0.4, 0.2);
         }
 
-        return float4(acc, 1.0);
+        return float4(result, 1.0);
     }
 
     case Status.Complete: {
