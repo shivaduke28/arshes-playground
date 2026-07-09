@@ -44,6 +44,17 @@ uniform float centerY;
 [size(1)]
 RWStructuredBuffer<float4> state;
 
+struct Ring {
+    float edge;       // start radius of this ring
+    float active;     // 1 = smear, 0 = pass through
+    float startAngle; // random band start angle (0-1)
+    float flip;       // 1 = reversed smear direction
+};
+
+// rings[MAX_RINGS].edge = end radius of the last ring
+[size(65)]
+RWStructuredBuffer<Ring> rings;
+
 float hash(float n, float sd) {
     return frac(sin(n * 127.1 + sd * 311.7) * 43758.5453);
 }
@@ -59,47 +70,74 @@ void computeMain(uint3 id : SV_DispatchThreadID) {
     }
     s.y = touch.z;
     state[0] = s;
+    float seed = s.x;
+
+    // build the ring table once per frame so the fragment shader
+    // doesn't have to re-accumulate widths per pixel
+    float edge = 0.0;
+    for (int i = 0; i < MAX_RINGS; i++) {
+        float fi = float(i);
+        // cubed hash: mostly thin rings with occasional thick ones
+        float h = hash(fi, seed);
+        float w = lerp(ringMin, ringMax, h * h * h);
+
+        Ring rg;
+        rg.edge = edge;
+        // golden-ratio sequence: ~density fraction of rings hit, evenly spread
+        rg.active = (frac(fi * 0.6180339887 + hash(7.3, seed)) <= density) ? 1.0 : 0.0;
+        rg.startAngle = hash(fi + 42.1, seed);
+        rg.flip = (randomDirection && hash(fi + 91.7, seed) < 0.5) ? 1.0 : 0.0;
+        rings[i] = rg;
+
+        edge += w;
+    }
+    Ring last;
+    last.edge = edge;
+    last.active = 0.0;
+    last.startAngle = 0.0;
+    last.flip = 0.0;
+    rings[MAX_RINGS] = last;
 }
 
 [shader("fragment")]
 float4 fragmentMain(float2 uv : TEXCOORD) : SV_Target {
-    float seed = state[0].x;
-
     // aspect-corrected space so rings stay circular
     float2 asp = float2(resolution.x / resolution.y, 1.0);
     float2 p = (uv - float2(centerX, centerY)) * asp;
     float r = length(p);
 
-    // walk outward through randomly sized rings to find the one containing r
-    float edge = 0.0;
-    float id = -1.0;
-    for (int i = 0; i < MAX_RINGS; i++) {
-        // cubed hash: mostly thin rings with occasional thick ones
-        float h = hash(float(i), seed);
-        float w = lerp(ringMin, ringMax, h * h * h);
-        if (r < edge + w) {
-            id = float(i);
-            break;
-        }
-        edge += w;
+    // outside the last ring: pass through
+    if (r >= rings[MAX_RINGS].edge) {
+        return float4(cameraTex.Sample(samp, uv), 1);
     }
 
-    // golden-ratio sequence: ~density fraction of rings hit, evenly spread
-    if (id < 0.0 || frac(id * 0.6180339887 + hash(7.3, seed)) > density) {
+    // binary search for the ring containing r
+    int lo = 0;
+    int hi = MAX_RINGS - 1;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) / 2;
+        if (r >= rings[mid].edge) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Ring rg = rings[lo];
+
+    if (rg.active < 0.5) {
         return float4(cameraTex.Sample(samp, uv), 1);
     }
 
     // per-ring random start angle (scaled by randomness) plus the shared offset
-    float phase = (hash(id + 42.1, seed) * randomness + offset) * 2.0 * PI;
+    float phase = (rg.startAngle * randomness + offset) * 2.0 * PI;
 
     // angular pixel stretch around the whole circle (single sector)
     float theta = atan2(p.y, p.x);
     float arc = 2.0 * PI;
     // pixels inside the smear region sample one edge of the band; outside stays put
     // flipped rings sample the far edge instead, reversing the smear direction
-    float flip = (randomDirection && hash(id + 91.7, seed) < 0.5) ? 1.0 : 0.0;
     float s = frac((theta + phase) / arc) * arc;
-    float newTheta = (s <= stretch * arc) ? theta - s + flip * stretch * arc : theta;
+    float newTheta = (s <= stretch * arc) ? theta - s + rg.flip * stretch * arc : theta;
 
     float2 q = float2(centerX, centerY) + r * float2(cos(newTheta), sin(newTheta)) / asp;
     float3 rgb = cameraTex.Sample(samp, fract(q));
