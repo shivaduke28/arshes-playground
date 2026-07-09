@@ -13,23 +13,29 @@ uniform Texture2D<float4> backbuffer;
 uniform SamplerState samp;
 uniform float3 touch;
 
-[range(0.5, 5.0, 2.0)]
+[range(0.5, 15.0, 2.0)]
 uniform float shutterSpeed;
 
-[range(0.1, 2.0, 0.5)]
-uniform float exposure;
-
-[range(0.0, 50.0, 5.0)]
+[range(0.0, 5.0, 1.0)]
 uniform float flashIntensity;
 
 [toggle(false)]
 uniform bool rearFlash;
 
-[range(0.0, 3.0, 1.0)]
+[range(0, 2, 1)]
+uniform float saturation;
+
+[range(0, 2, 1)]
 uniform float contrast;
 
-[range(0.0, 3.0, 1.0)]
-uniform float saturation;
+[range(0, 1, 0)]
+uniform float hueTarget;
+
+[range(0, 1, 0.1)]
+uniform float hueRange;
+
+[range(0, 1, 0.2)]
+uniform float saturationMin;
 
 [range(0.0, 0.1, 0.025)]
 uniform float borderWidth;
@@ -37,14 +43,14 @@ uniform float borderWidth;
 [range(0.0, 0.3, 0.05)]
 uniform float grain;
 
-[rgb(0.0, 0.0, 0.05)]
-uniform float3 lift;
-
-[rgb(0.0, 0.0, 0.0)]
-uniform float3 gamma;
-
-[rgb(1.0, 0.95, 0.9)]
-uniform float3 gain;
+public float3 rgb2hsv(float3 c) {
+    float4 K = float4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+    float4 p = lerp(float4(c.bg, K.wz), float4(c.gb, K.xy), step(c.b, c.g));
+    float4 q = lerp(float4(p.xyw, c.r), float4(c.r, p.yzx), step(p.x, c.r));
+    float d = q.x - min(q.w, q.y);
+    float e = 1.0e-10;
+    return float3(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
+}
 
 enum Status {
     Idle = 0,
@@ -58,7 +64,6 @@ struct State {
     int frameCount;
     float startTime;
     float prevTouchZ;
-    float avgDeltaTime;
 };
 
 [size(1)]
@@ -71,7 +76,6 @@ void updateState(uint3 id : SV_DispatchThreadID) {
     State s = state[0];
     bool tap = touch.z > 0.5 && s.prevTouchZ < 0.5;
     s.prevTouchZ = touch.z;
-    s.avgDeltaTime = lerp(s.avgDeltaTime, deltaTime, 0.1);
 
     switch (s.status) {
     case Status.Idle:
@@ -112,7 +116,6 @@ void updateState(uint3 id : SV_DispatchThreadID) {
     state[0] = s;
 }
 
-float3 toLinear(float3 c) { return pow(c, 2.2); }
 float3 toGamma(float3 c) { return pow(max(float3(0.0), c), 1.0 / 2.2); }
 
 float hash(float2 p) {
@@ -121,45 +124,57 @@ float hash(float2 p) {
     return fract((p3.x + p3.y) * p3.z);
 }
 
+float3 grade(float3 rgb, float saturation, float contrast) {
+    float grey = dot(rgb, float3(0.2126, 0.7152, 0.0722));
+    rgb = lerp(grey.xxx, rgb, saturation);
+    rgb = (rgb - 0.18) * contrast + 0.18;
+    return rgb;
+}
+
 [shader("fragment")]
 float4 fragmentMain(float2 uv : TEXCOORD) : SV_Target {
-    float3 cam = toLinear(cameraTex.Sample(samp, uv));
+    float3 cam = cameraTex.Sample(samp, uv);
     float4 prev = backbuffer.Sample(samp, uv);
 
-    float noise = hash(uv * resolution + float2(time * 1000.0, 0.0)) * 2.0 - 1.0;
+    // color grading
+    cam = grade(cam, saturation, contrast);
 
-    // grading
-    float3 graded = (cam - 0.5) * contrast + 0.5;
-    float lum = dot(graded, float3(0.2126, 0.7152, 0.0722));
-    graded = lerp(float3(lum), graded, saturation);
-    graded = pow(max(float3(0.0), graded * (1.0 + gain - lift) + lift), max(float3(0.0001), 1.0 - gamma));
-    graded += noise * grain;
+    // hue-based accumulation filter
+    var hsv = rgb2hsv(toGamma(cam));
+    let saturationCoeff = (1.0 - smoothstep(0, hueRange, min(abs(hsv.r - hueTarget), abs(1.0 - hueTarget))))
+        * smoothstep(saturationMin, saturationMin + 0.1, hsv.g);
+
+    // grain
+    float noise = hash(uv * resolution + float2(fract(time) * 1000.0, 0.0)) * 2.0 - 1.0;
+    cam += noise * grain;
 
     let s = state[0];
 
     switch (s.status) {
-    case Status.Idle:
-        float3 idle = graded * (exposure * shutterSpeed + (exposure + flashIntensity) * s.avgDeltaTime);
-        return float4(toGamma(idle), 1.0);
+    case Status.Idle: {
+        // preview: what the shot would look like if the scene stayed still
+        float3 idle = cam * (saturationCoeff * shutterSpeed + flashIntensity);
+        return float4(idle, 1.0);
+    }
 
     case Status.Flashing: {
-        float3 base = rearFlash ? toLinear(prev.rgb) : float3(0.0);
-        float3 acc = base + graded * (exposure + flashIntensity) * deltaTime;
-        return float4(toGamma(acc), 1.0);
+        float3 base = rearFlash ? prev.rgb : float3(0.0);
+        float3 acc = base + cam * flashIntensity;
+        return float4(acc, 1.0);
     }
 
     case Status.Shooting: {
         float elapsed = time - s.startTime;
 
-        float3 base = (s.frameCount == 0 && rearFlash) ? float3(0.0) : toLinear(prev.rgb);
-        float3 acc = base + graded * exposure * deltaTime;
+        float3 base = (s.frameCount == 0 && rearFlash) ? float3(0.0) : prev.rgb;
+        float3 acc = base + cam * deltaTime * saturationCoeff;
 
-        float3 result = toGamma(acc);
+        float3 result = acc;
 
         float progress = saturate(elapsed / shutterSpeed);
-        float barH = 0.006;
+        float barH = 1 / resolution.y;
         if (uv.y > 1.0 - barH && uv.x < progress) {
-            result = float3(1.0, 0.4, 0.2);
+            result = 1.0;
         }
 
         return float4(result, 1.0);
@@ -171,7 +186,7 @@ float4 fragmentMain(float2 uv : TEXCOORD) : SV_Target {
         float bwX = borderWidth;
         float bwY = borderWidth * resolution.x / resolution.y;
         if (uv.x < bwX || uv.x > 1.0 - bwX || uv.y < bwY || uv.y > 1.0 - bwY) {
-            result = float3(1.0);
+            result = 1.0;
         }
 
         return float4(result, 1.0);
