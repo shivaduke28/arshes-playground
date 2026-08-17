@@ -86,7 +86,14 @@ struct Track
 RWStructuredBuffer<Track> tracks;
 
 [size(16)]
-RWStructuredBuffer<float4> links; // MST edges: xy -> zw centers (uv), zero = unused
+RWStructuredBuffer<float4> links; // MST edges: xy -> zw corners (uv)
+
+// compact draw list so the fragment pass only touches visible boxes
+[size(17)]
+RWStructuredBuffer<float4> hudBoxes; // [0] = (box count, link count, 0, 0); [1..16] rects (uv)
+
+[size(16)]
+RWStructuredBuffer<int> hudIds; // original track slot per compacted box (label text)
 
 // --- linear sRGB (D65) -> CIELab ---
 float labF(float t)
@@ -564,9 +571,12 @@ void computeDetect(uint3 id : SV_DispatchThreadID)
         {
             nodes[nn] = tr.posVel.xy;
             rects[nn] = trackRect(tr);
+            hudBoxes[1 + nn] = rects[nn];
+            hudIds[nn] = g;
             nn++;
         }
     }
+    int ne = 0;
     if (nn >= 2)
     {
         bool inTree[NTRACK];
@@ -623,8 +633,10 @@ void computeDetect(uint3 id : SV_DispatchThreadID)
                 }
             }
             links[e] = float4(bestA, bestB);
+            ne = e + 1;
         }
     }
+    hudBoxes[0] = float4(float(nn), float(ne), 0.0, 0.0);
 }
 
 // --- 5x7 pixel font: 0-9, I, D, '/' — one 5-bit row per entry, 7 rows per glyph ---
@@ -660,34 +672,43 @@ float4 fragmentMain(float2 uv : TEXCOORD) : SV_Target
     float fs = max(2.0, round(resolution.y / 600.0));  // font pixel scale
     float lw = max(1.5, round(resolution.y / 840.0));  // box line half-width
 
-    // MST links between window centers, drawn under the windows
+    int nB = int(hudBoxes[0].x);
+    int nL = int(hudBoxes[0].y);
+
+    // MST links between window corners, drawn under the windows
     if (showLinks)
     {
         float lw2 = lw * 0.6;
-        for (int li = 0; li < NTRACK; li++)
+        for (int li = 0; li < nL; li++)
         {
             float4 seg = links[li];
-            if (dot(seg, seg) < 1e-8)
-                continue;
             float2 a = seg.xy * resolution;
             float2 b = seg.zw * resolution;
+            // cheap AABB reject before the segment distance
+            if (px.x < min(a.x, b.x) - lw2 || px.x > max(a.x, b.x) + lw2 ||
+                px.y < min(a.y, b.y) - lw2 || px.y > max(a.y, b.y) + lw2)
+                continue;
             float2 ab = b - a;
             float t = clamp(dot(px - a, ab) / max(dot(ab, ab), 1e-4), 0.0, 1.0);
             if (length(px - a - ab * t) < lw2)
-                col = lerp(col, float3(1.0, 1.0, 1.0), 1.0);
+                col = float3(1.0, 1.0, 1.0);
         }
     }
 
-    for (int i = 0; i < NTRACK; i++)
-    {
-        Track tr = tracks[i];
-        float alpha = tr.meta.z;
-        if (alpha < 0.02)
-            continue;
+    float labelW = 31.0 * fs;
+    float labelH = 9.0 * fs;
 
-        float4 r = trackRect(tr);
+    for (int i = 0; i < nB; i++)
+    {
+        float4 r = hudBoxes[1 + i];
         float2 mn = r.xy * resolution;
         float2 mx = r.zw * resolution;
+
+        // cheap reject against the union of box border and label tab
+        if (px.x < mn.x - lw - 1.0 || px.x > max(mx.x, mn.x + labelW) + lw ||
+            px.y < mn.y - labelH - 1.0 || px.y > mx.y + lw + 1.0)
+            continue;
+
         float2 c = (mn + mx) * 0.5;
         float2 h = (mx - mn) * 0.5;
         float2 q = abs(px - c);
@@ -696,22 +717,22 @@ float4 fragmentMain(float2 uv : TEXCOORD) : SV_Target
         bool hEdge = abs(q.y - h.y) < lw && q.x < h.x + lw;
 
         if (vEdge || hEdge)
-            col = lerp(col, float3(1.0, 1.0, 1.0), alpha);
+            col = float3(1.0, 1.0, 1.0);
 
-        // label tab: white fill, black "ID.nn", flush with the box top-left
-        int glyphs[5];
-        glyphs[0] = 10; // I
-        glyphs[1] = 11; // D
-        glyphs[2] = 12; // .
-        glyphs[3] = i / 10;
-        glyphs[4] = i % 10;
-
+        // label tab: white fill with "ID.nn" cut out, flush with the box top-left
         // 5 chars, 6-px advance, 1px padding: 2 + 5*6 - 1 = 31 x 9 font px
-        float2 lo = float2(mn.x - lw, mn.y - 9.0 * fs + lw);
+        float2 lo = float2(mn.x - lw, mn.y - labelH + lw);
         float2 lp = (px - lo) / fs;
         if (lp.x >= 0.0 && lp.x < 31.0 && lp.y >= 0.0 && lp.y < 9.0)
         {
-            // white tab with the glyphs cut out (camera shows through the text)
+            int id = hudIds[i];
+            int glyphs[5];
+            glyphs[0] = 10; // I
+            glyphs[1] = 11; // D
+            glyphs[2] = 12; // .
+            glyphs[3] = id / 10;
+            glyphs[4] = id % 10;
+
             int tx = int(floor(lp.x)) - 1;
             int ty = int(floor(lp.y)) - 1;
             bool text = false;
@@ -722,7 +743,7 @@ float4 fragmentMain(float2 uv : TEXCOORD) : SV_Target
                 text = ci < 5 && cx < 5 && glyphPix(glyphs[ci], int2(cx, ty));
             }
             if (!text)
-                col = lerp(col, float3(1.0, 1.0, 1.0), alpha);
+                col = float3(1.0, 1.0, 1.0);
         }
     }
 
